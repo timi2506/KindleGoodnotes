@@ -1,0 +1,9 @@
+# macOS & Python
+.DS_Store
+._*
+__pycache__/
+*.pyc
+
+# Sample archives & disassembled inspection outputs (kept locally)
+*.goodnotes
+disassembled/

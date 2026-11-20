@@ -1,0 +1,674 @@
+syntax = "proto3";
+
+package goodnotes;
+
+// ============================================================================
+// Goodnotes (.goodnotes) Reverse-Engineered Protocol Buffer Schema
+// Derived from Goodnotes/Test.goodnotes (schema_version = 35).
+//
+// Wire framing notes:
+//   - Single raw protobuf messages (NOT length-prefixed):
+//       * schema.pb (SchemaVersion)
+//       * search/<NoteLayerUUID> (PageSearchIndex)
+//       * Decompressed RichTextDocument inside RichTextContent.compressed_richtext
+//   - Varint-length-delimited protobuf streams (repeated [varint len][msg]):
+//       * index.notes.pb (IndexEntry)
+//       * index.attachments.pb (IndexEntry)
+//       * index.search.pb (SearchIndexEntry)
+//       * index.events.pb (EventEnvelope)
+//       * notes/<NoteLayerUUID> (alternating [NoteObjectHeader, NoteObjectPayload])
+//       * search/<PdfAttachmentUUID> (PdfSearchPage)
+//   - Empty files:
+//       * document.info.pb (0 bytes)
+//       * Empty note layer files (e.g. scanned PDF page with no ink) are 0 bytes.
+// ============================================================================
+
+// ----------------------------------------------------------------------------
+// 1. Container Metadata & Index Files
+// ----------------------------------------------------------------------------
+
+// Stored in schema.pb (single raw message).
+// Equals max(min_schema_version) across all objects in the archive (24..35).
+message SchemaVersion {
+  uint32 schema_version = 1;
+}
+
+// Stored in index.notes.pb and index.attachments.pb (delimited stream).
+message IndexEntry {
+  string uuid = 1; // NoteLayerUUID or logical AttachmentUUID (uppercase hyphenated)
+  string path = 2; // Archive path, e.g. "notes/<UUID>" or "attachments/<BlobUUID>"
+}
+
+// Stored in index.search.pb (delimited stream).
+message SearchIndexEntry {
+  string uuid = 1; // NoteLayerUUID or PdfAttachmentUUID
+  string path = 2; // "search/<UUID>"
+  uint32 kind = 3; // 0 (omitted) = PageSearchIndex, 1 = PdfSearchPage stream
+}
+
+// ----------------------------------------------------------------------------
+// 2. Shared Primitives & CRDT Types
+// ----------------------------------------------------------------------------
+
+message Point {
+  float x = 1; // 132 PPI Goodnotes canvas X (0.0 omitted in proto3)
+  float y = 2; // 132 PPI Goodnotes canvas Y (0.0 omitted in proto3)
+}
+
+message Size {
+  float width = 1;
+  float height = 2;
+}
+
+message Rect {
+  Point origin = 1; // Top-left or center depending on parent field
+  Size size = 2;
+}
+
+message ColorRGBA {
+  float r = 1; // 0.0..1.0
+  float g = 2; // 0.0..1.0
+  float b = 3; // 0.0..1.0
+  float a = 4; // 0.0..1.0
+}
+
+message LwwClock {
+  uint32 counter = 1;    // Mutation counter (0 omitted in proto3)
+  uint32 tiebreaker = 2; // Random uint32 tiebreaker
+}
+
+message LwwString {
+  string value = 1;
+  LwwClock clock = 2;
+}
+
+message LwwBytes {
+  bytes value = 1;
+  LwwClock clock = 2;
+}
+
+message LwwDouble {
+  double value = 1;
+  LwwClock clock = 2;
+}
+
+message LwwUint32 {
+  uint32 value = 1;
+  LwwClock clock = 2;
+}
+
+message LwwEmpty {
+  LwwClock clock = 2;
+}
+
+message ZOrder {
+  LwwClock entry = 1; // counter = 0-based z-index, tiebreaker = random uint32
+}
+
+// ----------------------------------------------------------------------------
+// 3. Event Log (index.events.pb)
+// ----------------------------------------------------------------------------
+
+message EventEnvelope {
+  string entity_uuid = 1;
+  oneof event {
+    CreatePageTemplate create_page_template = 2;
+    RegisterAttachment register_attachment = 6;
+    UpdateCurrentPage update_current_page = 10;
+    CreateDocument create_document = 30;
+    CreatePage create_page = 54;
+    NoteLayerCheckpoint note_layer_checkpoint = 102;
+    PdfSearchIndexed pdf_search_indexed = 103;
+    PageSearchIndexed page_search_indexed = 104;
+    SearchIndexJob search_index_job = 105;
+  }
+}
+
+message CreateDocument {
+  string document_id = 1;
+  LwwString title = 2;
+  LwwString folder_id = 3;
+  LwwBytes doc_type_marker = 6; // Observed: "P" (0x50)
+  LwwString parent_folder_id = 7;
+  string recognition_lang = 9;  // Observed: "auto"
+  double timestamp_ms = 10;     // Unix epoch milliseconds
+  string event_id = 11;
+  uint64 replica_id = 13;
+  uint64 lamport = 14;
+  bytes reserved_17 = 17;       // Observed: ""
+  bytes reserved_18 = 18;       // Observed: ""
+  LwwEmpty reserved_19 = 19;
+  uint32 schema_version = 20;   // Observed: 24
+}
+
+message PdfAttachmentMeta {
+  uint32 page_count = 1;
+  uint32 version = 2;
+}
+
+message RegisterAttachment {
+  string logical_attachment_id = 1;
+  string storage_blob_id = 2;   // Maps to attachments/<storage_blob_id>
+  uint64 byte_size = 5;
+  string document_id = 6;
+  double timestamp_ms = 10;
+  string event_id = 11;
+  PdfAttachmentMeta pdf_meta = 12; // Empty bytes for PNG/JPEG; populated for PDFs
+  uint64 replica_id = 14;
+  uint64 lamport = 15;
+  uint32 schema_version = 16;   // Observed: 24
+}
+
+message RulingLayout {
+  Rect bounds = 1;                    // Active ruling grid bounds in 132 PPI units
+  float row_pitch_minus_stroke = 2;   // Vertical/grid pitch minus stroke_thickness
+  float stroke_thickness = 3;         // Line thickness or dot diameter
+  uint32 ruling_kind = 5;             // 1 = dotted, 2 = horizontal ruled
+}
+
+message CreatePageTemplate {
+  string document_id = 1;
+  string template_id = 2;
+  string logical_attachment_id = 4; // Backing template PDF attachment
+  uint32 pdf_page_number = 5;       // 1-based page index inside template PDF
+  uint32 is_builtin_template = 6;   // 1 for built-in templates, 0/omitted for imported PDFs
+  double line_spacing = 7;          // Line/grid spacing in 132 PPI units
+  Size page_size = 8;               // Canvas size in 132 PPI units (e.g. 1091.35 x 1543.46 for A4)
+  string template_name = 9;         // Empty for imported/scanned PDFs
+  double timestamp_ms = 10;
+  string event_id = 11;
+  LwwDouble line_spacing_lww = 12;
+  LwwUint32 has_ruling_lww = 13;    // 1 when ruled/dotted
+  uint64 replica_id = 15;
+  uint64 lamport = 16;
+  LwwUint32 paper_theme_lww = 17;   // 1 = light, 2 = dark, 0/omitted = imported PDF
+  RulingLayout ruling_layout = 18;
+  LwwEmpty reserved_19 = 19;
+  uint32 schema_version = 21;       // Observed: 24
+}
+
+message PageStylePair {
+  ColorRGBA primary_color = 1;   // Observed: (0.867, 0.867, 0.867, 1.0)
+  ColorRGBA secondary_color = 2; // Observed: (1.0, 1.0, 1.0, 1.0)
+}
+
+message PageStyleBody {
+  PageStylePair colors = 2;
+}
+
+message PageStyleLww {
+  PageStyleBody style = 1;
+  LwwClock clock = 2;
+}
+
+message CreatePage {
+  string document_id = 1;
+  string page_id = 2;        // NoteLayerUUID = UUID(int = UUID(page_id).int + 1)
+  LwwString template_id = 3;
+  LwwString order_key = 4;   // Fractional lexicographic ASCII sort key ("4BPpG1", "A3X5-", ...)
+  double timestamp_ms = 10;
+  string event_id = 11;
+  uint64 replica_id = 13;
+  uint64 lamport = 14;
+  uint32 schema_version = 15; // Observed: 24
+  PageStyleLww page_style = 17;
+}
+
+message UpdateCurrentPage {
+  string document_id = 1;
+  string active_page_id = 2;
+  string editor_session_id = 3; // e.g. "DocumentEditor:<UUID>"
+  double timestamp_ms = 10;
+  string event_id = 11;
+  uint64 replica_id = 13;
+  uint64 lamport = 14;
+  uint32 schema_version = 15;
+}
+
+message NoteLayerCheckpoint {
+  string note_layer_id = 1;
+  double timestamp_ms = 10;
+  string event_id = 11;
+  uint64 replica_id = 13;
+  uint64 lamport = 14;
+  uint32 schema_version = 15;
+  string document_id = 16;
+}
+
+message PdfSearchIndexed {
+  string pdf_attachment_id = 1;
+  string document_id = 2;
+  double timestamp_ms = 10;
+  string event_id = 11;
+  uint32 status = 14;
+  string index_run_id = 16;
+  uint64 replica_id = 18;
+  uint64 lamport = 19;
+  uint32 schema_version = 20;
+}
+
+message PageSearchIndexed {
+  string document_id = 1;
+  string note_layer_id = 2;
+  double timestamp_ms = 10;
+  string event_id = 11;
+  uint64 content_hash_u64 = 12; // Matches PageSearchIndex.content_hash_u64
+  string lang = 13;
+  uint32 status = 14;
+  string index_run_id = 15;
+  uint64 replica_id = 17;
+  uint64 lamport = 18;
+  uint32 schema_version = 19;
+}
+
+message SearchIndexJob {
+  uint32 job_type = 1;            // 1 = page note layer, 0/omitted = PDF attachment
+  string document_id = 2;
+  string pdf_attachment_id = 3;   // Set when job_type == 0
+  string note_layer_id = 4;       // Set when job_type == 1
+  uint64 content_hash_u64 = 5;
+  string lang = 6;
+  double timestamp_ms = 10;
+  string event_id = 11;
+  uint64 replica_id = 13;
+  uint64 lamport = 14;
+  uint32 schema_version = 15;
+}
+
+// ----------------------------------------------------------------------------
+// 4. Note Layer Objects (notes/<NoteLayerUUID>)
+// ----------------------------------------------------------------------------
+
+// First message of every paired record in notes/<NoteLayerUUID>.
+message NoteObjectHeader {
+  string object_id = 1;
+  LwwClock revision = 2;            // Always identical to payload's revision
+  uint32 is_deleted = 3;            // 1 when soft-deleted/erased
+  string attachment_id = 4;         // Present on ImageItem (tag 1)
+  uint64 replica_id = 8;
+  uint64 lamport = 9;
+  uint64 const_5381 = 14;           // Observed constant 5381 across all objects
+  uint32 min_schema_version = 16;   // 24, 25 (pencil), 31 (connector), or 35 (sticky/text/shape)
+  string parent_container_id = 20;  // Parent StickyNoteItem UUID for ink drawn on sticky note
+}
+
+// Second message of every paired record in notes/<NoteLayerUUID>.
+message NoteObjectPayload {
+  oneof item {
+    ImageItem image = 1;
+    StrokeItem stroke = 7;
+    ShapeFillItem shape_fill = 9;
+    StickyNoteItem sticky_note = 20;
+    TextOrShapeItem text_or_shape = 21;
+    ConnectorItem connector = 22;
+  }
+}
+
+// Tag 1: Photos, Stickers/Elements, Math Assist Graphs
+message ImageItem {
+  string id = 1;
+  Rect bounding_box = 2;         // origin = top-left
+  Rect center_frame = 3;         // origin = center (topLeft + size/2)
+  string attachment_id = 4;
+  ZOrder z_order = 5;
+  uint32 is_sticker_element = 6; // 1 for Goodnotes Elements/Stickers
+  string element_asset_id = 7;   // Element collection item UUID
+  LwwClock revision = 15;
+  uint32 min_schema_version = 18; // Observed: 24
+  string math_graph_id = 19;      // Present on Math Assist plotted graphs
+  bytes math_graph_json = 20;     // UTF-8 JSON with model.associatedLines, functions, xDomain, yDomain
+}
+
+message PolylinePoints {
+  repeated Point points = 1;
+}
+
+message EllipseSpec {
+  Point center = 1;
+  Point radii = 2;        // x = rx, y = ry
+  float rotation_rad = 3;
+}
+
+message SnappedShapeFlags {
+  uint32 is_snapped = 2; // Observed: 1
+}
+
+message SnappedShapeGeometry {
+  PolylinePoints polyline = 1;
+  EllipseSpec ellipse = 4;
+  SnappedShapeFlags flags = 5;
+  float stroke_width = 15;
+}
+
+message TapeAttributes {
+  bytes reserved_1 = 1; // Present as empty bytes {1: ""} on Study Tape strokes
+}
+
+message ParentContainerRef {
+  // Wire bytes are "\n$" + ASCII UUID string (field 1 inside a submessage, or string directly)
+  string parent_id = 1;
+}
+
+// Tag 7: All Pen, Pencil, Highlighter, Study Tape, and Snapped Shape Strokes
+message StrokeItem {
+  string id = 1;
+  // Apple COMPRESSION_LZ4 (bv41/bv4$/bv4-) compressed `tpl\x00` binary stroke payload.
+  bytes compressed_tpl = 2;
+  // 0 (omitted) = Ballpoint / Highlighter / SnappedShape (Format 1 TPL)
+  // 1 = Fountain Pen / Brush Pen / Study Tape (Format 2 TPL)
+  // 5 = Pencil (Format 3 TPL, min_schema_version = 25)
+  uint32 pen_type = 3;
+  ColorRGBA color = 4;
+  uint32 is_highlighter = 5;              // 1 for Highlighter
+  Point local_offset = 6;                 // Empty normally; (-parent.x, -parent.y) when attached to StickyNote
+  ZOrder z_order = 7;
+  SnappedShapeGeometry snapped_shape = 9; // Populated for snapped lines, polygons, arrows, ellipses
+  uint32 is_deleted = 14;                 // 1 when tombstoned
+  LwwClock revision = 15;
+  TapeAttributes tape_attributes = 20;    // Populated ({1: ""}) for Study Tape strokes
+  uint32 min_schema_version = 21;         // 24 or 25 (Pencil)
+  ParentContainerRef parent_ref = 100;    // Present when drawn on a StickyNote
+}
+
+message FillGeometry {
+  PolylinePoints polygon = 1;
+  EllipseSpec ellipse = 4;
+}
+
+// Tag 9: Semi-transparent fill paired with a snapped StrokeItem
+message ShapeFillItem {
+  string id = 1;
+  Rect bounding_box = 2; // (NaN, NaN, NaN, NaN) when tombstoned
+  ZOrder z_order = 3;
+  FillGeometry fill_geometry = 4;
+  string associated_stroke_id = 5;
+  bytes reserved_6 = 6;
+  ColorRGBA fill_color = 7;       // Typically (1, 1, 1, 0.1)
+  uint32 is_deleted = 14;         // 1 when tombstoned
+  LwwClock revision = 15;
+  uint32 min_schema_version = 18; // Observed: 24
+}
+
+message Transform {
+  Point origin = 1; // Top-left position on page
+  float scale = 3;  // Uniform scale (1.0)
+}
+
+message FixedSizeBox {
+  float width = 1;
+  float height = 2;
+  float max_height = 3; // Observed: +inf
+}
+
+message AutoSizeBox {
+  float min_width = 1;
+  float max_width = 2;
+  float min_height = 3;
+  float max_height = 4; // Observed: +inf
+}
+
+message SizeConstraints {
+  FixedSizeBox fixed = 2;
+  AutoSizeBox auto_box = 3;
+}
+
+message EmptyMarker {
+  bytes value = 1; // Observed: ""
+}
+
+message RectShapeSpec {
+  float corner_radius = 1; // 0/empty = sharp rectangle; >0 = rounded rect / pill
+}
+
+message PolygonVertex {
+  Point point = 1;         // Normalized [0..1] coordinates inside bounding box
+  uint32 vertex_type = 2;  // Observed: 1
+  float corner_radius = 3; // Per-vertex corner rounding (e.g. 5.0)
+}
+
+message PolygonShapeDef {
+  repeated PolygonVertex vertices = 1;
+  uint32 closed = 2; // 1 = closed polygon
+}
+
+message PolygonShapeSpec {
+  PolygonShapeDef polygon = 1;
+}
+
+message ShapeGeometrySpec {
+  RectShapeSpec rect = 1;
+  PolygonShapeSpec polygon = 3;
+}
+
+message ColorHolder {
+  ColorRGBA color = 1;
+}
+
+message FillStyleWrapper {
+  ColorHolder fill = 1;
+}
+
+message StrokeStyle {
+  float width = 1;
+  EmptyMarker dash_or_cap = 2;
+  ColorHolder stroke_color = 3;
+}
+
+message ShadowOpacity {
+  float opacity = 4;
+}
+
+message ShadowBlur {
+  float radius = 2;
+}
+
+message DropShadow {
+  ShadowOpacity opacity = 1;
+  ShadowBlur blur = 3;
+}
+
+// ----------------------------------------------------------------------------
+// 5. Rich Text Container & Compressed RichTextDocument
+// ----------------------------------------------------------------------------
+
+message RichTextContent {
+  bytes compressed_richtext = 2; // Apple bv41 LZ4-compressed RichTextDocument
+  bytes content_hash = 3;        // 8-byte deterministic hash (exact algorithm unconfirmed)
+  uint32 format_version = 4;     // Observed: 1
+}
+
+message DefaultCharStyle {
+  ColorRGBA text_color = 3;
+  string font_family = 30;  // Observed: "Helvetica Neue"
+  float font_size = 40;
+  int64 unknown_s64_60 = 60; // Observed: -60
+  float unknown_f32_70 = 70; // Observed: -20.0
+}
+
+message DefaultParagraphInner {
+  int64 val_1 = 1; // Observed: -1
+  int64 val_2 = 2; // Observed: -1
+}
+
+message DefaultParagraphStyle {
+  EmptyMarker marker_1 = 1;
+  bytes marker_2 = 2;
+  DefaultParagraphInner inner_3 = 3;
+}
+
+message RichTextDefaultStyle {
+  DefaultCharStyle char_style = 1;
+  DefaultParagraphStyle paragraph_style = 2;
+}
+
+message TextInsets {
+  float top = 1;
+  float left = 2;
+  float bottom = 3;
+  float right = 4;
+}
+
+message RichTextContainer {
+  RichTextContent content = 1;
+  Size measured_size = 2;
+  RichTextDefaultStyle default_style = 5;
+  TextInsets insets = 10;
+  bytes reserved_11 = 11;
+}
+
+// Decompressed payload inside RichTextContent.compressed_richtext (single raw message).
+message RichTextDocument {
+  repeated TextRun runs = 1;
+}
+
+message TextRun {
+  string text = 1;
+  CharStyle char_style = 2;
+  ParagraphStyle paragraph_style = 3;
+}
+
+message CharStyle {
+  ColorRGBA text_color = 3;
+  string hyperlink_url = 4;      // e.g. "https://app.goodnotes.com/documents/?anchor=...#<docB64>"
+  ColorRGBA highlight_color = 5;
+  float font_size = 40;          // -404.0 = inherit from DefaultCharStyle
+  int64 unknown_s64_60 = 60;     // -404 = inherit
+  float unknown_f32_70 = 70;     // -404.0 = inherit
+}
+
+message ParagraphStyle {
+  EmptyMarker marker_1 = 1;
+  DefaultParagraphInner marker_2 = 2; // {1: -1}
+  DefaultParagraphInner marker_3 = 3; // {1: -1, 2: -1}
+  uint32 alignment = 4;               // 0/omitted = left, 2 = center
+}
+
+// Tag 20: Sticky Notes (schema >= 35)
+message StickyNoteItem {
+  string id = 1;
+  uint32 min_schema_version = 2; // 35
+  LwwClock revision = 3;
+  ZOrder z_order = 7;
+  Transform transform = 20;
+  SizeConstraints size_constraints = 21; // Default 256 x 256
+  ColorRGBA background_color = 30;
+  RichTextContainer rich_text = 31;
+  string author_id = 32;
+  string author_name = 33;
+  uint32 flag_40 = 40; // Observed: 1
+  uint32 flag_41 = 41; // Observed: 1
+}
+
+// Tag 21: Text Boxes & Diagram/Flowchart Shapes (schema >= 35)
+message TextOrShapeItem {
+  string id = 1;
+  uint32 min_schema_version = 2; // 35
+  LwwClock revision = 3;
+  ZOrder z_order = 7;
+  uint32 is_textbox = 9; // 1 for Text Box, 0/omitted for Diagram/Flowchart shapes
+  Transform transform = 20;
+  SizeConstraints size_constraints = 21;
+  ShapeGeometrySpec shape_kind = 22;
+  FillStyleWrapper fill_style = 30;
+  StrokeStyle border_style = 31;
+  RichTextContainer rich_text = 32;
+  DropShadow shadow = 33;
+}
+
+message PointWrapper1 {
+  Point point = 1;
+}
+
+message PointWrapper2 {
+  Point point = 2;
+}
+
+message CurvedConnectorPath {
+  PointWrapper1 start = 1;
+  Point control = 2;
+  PointWrapper1 end = 3;
+}
+
+message StraightOrElbowPath {
+  PointWrapper1 start = 1;
+  PointWrapper1 end = 3;
+  uint32 mode = 4; // Observed: 1
+  PointWrapper2 midpoint = 5;
+}
+
+// Tag 22: Diagram Connectors / Arrows (schema >= 31)
+message ConnectorItem {
+  string id = 1;
+  uint32 min_schema_version = 2; // 31
+  LwwClock revision = 3;
+  ZOrder z_order = 7;
+  CurvedConnectorPath curved_path = 20;
+  StraightOrElbowPath straight_or_elbow_path = 21;
+  uint32 end_arrowhead = 31; // 1 = arrowhead at end point
+  StrokeStyle stroke_style = 32;
+}
+
+// ----------------------------------------------------------------------------
+// 6. Search Index Files (search/<UUID>)
+// ----------------------------------------------------------------------------
+
+message TextTokenBox {
+  uint32 start_char = 1; // 0 omitted
+  uint32 length = 2;
+  Rect local_box = 3;
+}
+
+message AffineTransform2D {
+  float a = 1;
+  float b = 2;
+  float c = 3;
+  float d = 4;
+  float tx = 5;
+  float ty = 6;
+}
+
+message TypedTextLayout {
+  repeated TextTokenBox tokens = 2;
+  AffineTransform2D transform = 3;
+}
+
+message SearchStrokeRef {
+  string internal_id = 1;
+  Rect bounding_box = 2;
+  string stroke_uuid = 3;
+  repeated Point sample_points = 4;
+  ColorRGBA color = 5;
+  float max_width = 6;
+}
+
+message HandwritingWordCandidate {
+  Rect bounding_box = 1;
+  repeated string candidates = 3;
+  bytes packed_scores_4 = 4;          // Packed little-endian float32 array (1 per candidate)
+  repeated string norm_candidates = 5;
+  bytes packed_confidences_6 = 6;     // Packed little-endian float32 array
+  repeated SearchStrokeRef strokes = 7;
+  bytes packed_scores_9 = 9;          // Packed little-endian float32 array
+  repeated string raw_candidates = 10;
+  string locale = 11;                 // e.g. "en_US", "en_GB", "ko_KR", "ja_JP"
+}
+
+// Stored in search/<NoteLayerUUID> (single raw protobuf message).
+message PageSearchIndex {
+  repeated string typed_texts = 3;
+  repeated TypedTextLayout typed_layouts = 4;
+  string page_id = 5;                 // Points to PageUUID (NoteLayerUUID - 1)
+  repeated HandwritingWordCandidate handwriting_words = 6;
+  uint64 content_hash_u64 = 12;
+  string lang = 13;                   // Observed: "auto"
+  float index_version = 14;           // Observed: 5.0
+  uint32 hwr_model_version = 15;      // Observed: 23101502
+  uint32 status = 16;                 // Observed: 1
+  repeated bytes reserved_17 = 17;
+}
+
+// Stored in search/<PdfAttachmentUUID> (delimited stream, one message per PDF page).
+message PdfSearchPage {
+  uint32 page_number = 2;    // 1-based PDF page number
+  string extracted_text = 3;
+}
