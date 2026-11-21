@@ -572,7 +572,7 @@ def decode_stroke_tpl(raw_tpl: bytes) -> Dict[str, Any]:
         subpath_counts = vals[4]
         o_ops = vals[5]
         o_moves = [u32_to_f32(x) for x in vals[6]]
-        o_lines = [u32_to_f32(x) for x in vals[7]]
+        o_quads = [u32_to_f32(x) for x in vals[7]]
         o_cubics = [u32_to_f32(x) for x in vals[8]]
         o_arcs = [u32_to_f32(x) for x in vals[9]]
         o_arc_cw = vals[10]
@@ -608,7 +608,7 @@ def decode_stroke_tpl(raw_tpl: bytes) -> Dict[str, Any]:
         # Reconstruct outline subpaths
         outlines = []
         op_cursor = 0
-        mi = li = ci = ai = wi = 0
+        mi = qi_o = ci = ai = wi = 0
         for cnt in subpath_counts:
             sub_cmds = []
             for _ in range(cnt):
@@ -618,8 +618,12 @@ def decode_stroke_tpl(raw_tpl: bytes) -> Dict[str, Any]:
                     sub_cmds.append({"op": "moveTo", "x": o_moves[mi], "y": o_moves[mi + 1]})
                     mi += 2
                 elif oop == 1:
-                    sub_cmds.append({"op": "lineTo", "x": o_lines[li], "y": o_lines[li + 1]})
-                    li += 2
+                    sub_cmds.append({
+                        "op": "quadTo",
+                        "cx": o_quads[qi_o], "cy": o_quads[qi_o + 1],
+                        "ex": o_quads[qi_o + 2], "ey": o_quads[qi_o + 3],
+                    })
+                    qi_o += 4
                 elif oop == 2:
                     sub_cmds.append({
                         "op": "cubicTo",
@@ -691,6 +695,61 @@ def decode_stroke_tpl(raw_tpl: bytes) -> Dict[str, Any]:
             "quad_segments": quads,
         }
     return {"tpl_format": fmt, "kind": "Unknown", "raw_vals": vals}
+
+
+def _assert_finite_u32(u: int, label: str) -> None:
+    assert math.isfinite(u32_to_f32(u)), f"Non-finite float in {label}: 0x{u:08x}"
+
+
+def validate_stroke_tpl(fmt: str, vals: List[Any]) -> None:
+    """Validate structural and array-consumption invariants enforced by Goodnotes stroke deserializers."""
+    if fmt == "vuA(v)A(S(uu))A(S(uuuu))vA(f)":
+        ver, w_u, ops, moves, quads = vals[0], vals[1], vals[2], vals[3], vals[4]
+        assert ver <= 2, f"Unexpected Format 1 TPL version {ver}"
+        _assert_finite_u32(w_u, "fmt1.full_width")
+        assert all(op in (0, 1) for op in ops), f"Invalid Format 1 ops: {set(ops)}"
+        assert len(moves) == ops.count(0), f"Format 1 move count mismatch: {len(moves)} != {ops.count(0)}"
+        assert len(quads) == ops.count(1), f"Format 1 quad count mismatch: {len(quads)} != {ops.count(1)}"
+        for x, y in moves:
+            _assert_finite_u32(x, "fmt1.move")
+            _assert_finite_u32(y, "fmt1.move")
+        for seg in quads:
+            for u in seg:
+                _assert_finite_u32(u, "fmt1.quad")
+    elif fmt == "vA(v)A(u)A(u)A(v)A(v)A(u)A(u)A(u)A(u)A(v)":
+        ver, c_ops, starts, segs, subs, o_ops, o_moves, o_quads, o_cubics, o_arcs, o_arc_cw = vals
+        assert ver <= 2, f"Unexpected Format 2 TPL version {ver}"
+        assert all(op in (0, 1, 4, 5) for op in c_ops), f"Invalid Format 2 c_ops: {set(c_ops)}"
+        c0, c1, c4, c5 = c_ops.count(0), c_ops.count(1), c_ops.count(4), c_ops.count(5)
+        assert len(starts) == 3 * c0 + 4 * c4, f"Format 2 starts mismatch: {len(starts)} != {3 * c0 + 4 * c4}"
+        assert len(segs) == 6 * c1 + 9 * c5, f"Format 2 segs mismatch: {len(segs)} != {6 * c1 + 9 * c5}"
+        assert len(subs) == c1 + c5, f"Format 2 subpath_counts ({len(subs)}) != centerline quad count ({c1 + c5})"
+        assert sum(subs) == len(o_ops), f"Format 2 sum(subpath_counts) ({sum(subs)}) != len(o_ops) ({len(o_ops)})"
+        assert all(op in (0, 1, 2, 3, 6) for op in o_ops), f"Invalid Format 2 o_ops: {set(o_ops)}"
+        o0, o1, o2, o3, o6 = o_ops.count(0), o_ops.count(1), o_ops.count(2), o_ops.count(3), o_ops.count(6)
+        assert len(o_moves) == 2 * o0, f"Format 2 o_moves mismatch: {len(o_moves)} != {2 * o0}"
+        assert len(o_quads) == 4 * o1, f"Format 2 o_quads mismatch: {len(o_quads)} != {4 * o1}"
+        assert len(o_cubics) == 6 * o2, f"Format 2 o_cubics mismatch: {len(o_cubics)} != {6 * o2}"
+        assert len(o_arcs) == 5 * o3 + 7 * o6, f"Format 2 o_arcs mismatch: {len(o_arcs)} != {5 * o3 + 7 * o6}"
+        assert len(o_arc_cw) == o3 + o6, f"Format 2 o_arc_cw mismatch: {len(o_arc_cw)} != {o3 + o6}"
+        for label, arr in (
+            ("fmt2.starts", starts), ("fmt2.segs", segs), ("fmt2.o_moves", o_moves),
+            ("fmt2.o_quads", o_quads), ("fmt2.o_cubics", o_cubics), ("fmt2.o_arcs", o_arcs),
+        ):
+            for u in arr:
+                _assert_finite_u32(u, label)
+    elif fmt == "vuA(v)A(S(uuuuu))A(S(uuuuuuuuuuu))A(S(uu))A(v)A(S(uu))A(S(uuuu))A(u)":
+        _, w_u, ops, moves, quads = vals[0], vals[1], vals[2], vals[3], vals[4]
+        _assert_finite_u32(w_u, "fmt3.base_width")
+        assert all(op in (0, 1) for op in ops), f"Invalid Format 3 ops: {set(ops)}"
+        assert len(moves) == ops.count(0), f"Format 3 moves mismatch: {len(moves)} != {ops.count(0)}"
+        assert len(quads) == ops.count(1), f"Format 3 quads mismatch: {len(quads)} != {ops.count(1)}"
+        for m in moves:
+            for u in m:
+                _assert_finite_u32(u, "fmt3.move")
+        for seg in quads:
+            for u in seg[1:]:
+                _assert_finite_u32(u, "fmt3.quad")
 
 
 # ---------------------------------------------------------------------------
@@ -1806,8 +1865,11 @@ def render_svg_previews(archive_path: Path, out_dir: Path) -> List[Path]:
                                 cop = cmd["op"]
                                 if cop == "moveTo":
                                     d_cmds.append(f"M {cmd['x'] + dx:.2f} {cmd['y'] + dy:.2f}")
-                                elif cop == "lineTo":
-                                    d_cmds.append(f"L {cmd['x'] + dx:.2f} {cmd['y'] + dy:.2f}")
+                                elif cop == "quadTo":
+                                    d_cmds.append(
+                                        f"Q {cmd['cx'] + dx:.2f} {cmd['cy'] + dy:.2f} "
+                                        f"{cmd['ex'] + dx:.2f} {cmd['ey'] + dy:.2f}"
+                                    )
                                 elif cop == "cubicTo":
                                     d_cmds.append(
                                         f"C {cmd['c1x'] + dx:.2f} {cmd['c1y'] + dy:.2f} "
@@ -2468,10 +2530,11 @@ def verify_archive(archive_path: Path) -> None:
                     dec = decompress_bv41(comp)
                     bv41_checked += 1
 
-                    # Round-trip TPL byte-for-byte
+                    # Round-trip TPL byte-for-byte & validate Goodnotes invariants
                     fmt, raw_vals = parse_tpl_raw(dec)
                     re_tpl = encode_tpl(fmt, raw_vals)
                     assert re_tpl == dec, f"TPL round-trip mismatch on {hd[1][0][1]}"
+                    validate_stroke_tpl(fmt, raw_vals)
                     tpl_checked += 1
 
                     # Round-trip bv41 pure Python + macOS libcompression cross-check

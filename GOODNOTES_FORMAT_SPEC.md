@@ -378,10 +378,10 @@ Format 2 stores **both** the raw variable-width centerline AND the pre-tessellat
 | `[1]` | `A(v)` | `centerline_ops` | Circular nib (Fountain/Brush): `0` = moveTo (3 floats in `[2]`), `1` = quadTo (6 floats in `[3]`). Elliptical/chisel nib (Study Tape, `f7.20={1:""}`): `4` = ellipticalMoveTo (4 floats in `[2]`), `5` = ellipticalQuadTo (9 floats in `[3]`) |
 | `[2]` | `A(u)` | `start_floats` | Circular (`op 0`): `[x, y, halfWidth]`. Elliptical (`op 4`): `[x, y, majorR, angle]` |
 | `[3]` | `A(u)` | `segment_floats` | Circular (`op 1`): `[cx, cy, cHalfW, ex, ey, eHalfW]`. Elliptical (`op 5`): `[cx, cy, cR, ex, ey, eR, cAngle, eAngle, flatness=0.1]` |
-| `[4]` | `A(v)` | `subpath_op_counts` | Number of outline commands in each closed subpath; `sum([4]) == len([5])` |
-| `[5]` | `A(v)` | `outline_ops` | `0` = moveTo, `1` = lineTo, `2` = cubicTo, `3` = circular arc, `6` = elliptical arc |
+| `[4]` | `A(v)` | `subpath_op_counts` | Number of outline commands in each closed subpath; `len([4]) == count(c_ops in {1, 5})` and `sum([4]) == len([5])` |
+| `[5]` | `A(v)` | `outline_ops` | `0` = moveTo, `1` = quadTo (`PQuadCurveTo`), `2` = cubicTo (`PCubicCurveTo`), `3` = circular arc (`PArc`), `6` = elliptical arc (`PEllipticalArc`) |
 | `[6]` | `A(u)` | `outline_moves` | 2 floats `(x, y)` per `op == 0` |
-| `[7]` | `A(u)` | `outline_lines` | 2 floats `(x, y)` per `op == 1` |
+| `[7]` | `A(u)` | `outline_quads` | 4 floats `(cx, cy, ex, ey)` per `op == 1` |
 | `[8]` | `A(u)` | `outline_cubics` | 6 floats `(c1x, c1y, c2x, c2y, ex, ey)` per `op == 2` |
 | `[9]` | `A(u)` | `outline_arcs` | Circular (`op 3`): 5 floats `(cx, cy, r, startAngle, endAngle)`. Elliptical (`op 6`): 7 floats `(cx, cy, rx, ry, startAngle, endAngle, rotation)` |
 | `[10]` | `A(v)` | `outline_arc_cw` | 1 `uint16` (`0` or `1`) per arc (`op 3` or `op 6`) in CoreGraphics Y-up convention |
